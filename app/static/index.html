@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Geospatial Measurement Viewer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; color: #1f2937; }
+    header { padding: 12px 20px; background: #0f172a; color: #fff; }
+    header h1 { margin: 0; font-size: 18px; }
+    header p { margin: 2px 0 0; font-size: 12px; color: #94a3b8; }
+    main { display: grid; grid-template-columns: 400px 1fr; height: calc(100vh - 62px); }
+    aside { padding: 16px; overflow-y: auto; border-right: 1px solid #e5e7eb; }
+    #map { height: 100%; }
+    #drop { display: block; padding: 28px 12px; text-align: center; cursor: pointer;
+            border: 2px dashed #94a3b8; border-radius: 10px; color: #475569; }
+    #drop.over { background: #eff6ff; border-color: #2563eb; }
+    #message { margin: 12px 0; font-size: 14px; }
+    #message.error { color: #b91c1c; }
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+    .card { background: #f1f5f9; border-radius: 8px; padding: 8px 10px; }
+    .card b { display: block; font-size: 15px; }
+    .card span { font-size: 11px; color: #64748b; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #e5e7eb; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #f1f5f9; }
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; grid-template-rows: auto 60vh; height: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Geospatial Measurement Viewer</h1>
+    <p>Upload a KML or zipped Shapefile. Areas and lengths are measured in a projected CRS (UTM).</p>
+  </header>
+  <main>
+    <aside>
+      <label id="drop" for="fileInput">Drop a .kml or .zip here, or click to browse</label>
+      <input type="file" id="fileInput" accept=".kml,.zip" hidden>
+      <div id="message"></div>
+      <div id="summary" class="cards"></div>
+      <table id="results" hidden>
+        <thead><tr><th>#</th><th>Name</th><th>Type</th><th>Area</th><th>Length</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </aside>
+    <div id="map"></div>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // ---------- Map setup ----------
+    const map = L.map("map").setView([20, 0], 2);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+
+    let shapesLayer = null;
+    const layersByIndex = {};
+
+    // ---------- Helpers ----------
+    const $ = (id) => document.getElementById(id);
+    const fmt = (n) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    function showMessage(text, isError = false) {
+      const el = $("message");
+      el.textContent = text;
+      el.className = isError ? "error" : "";
+    }
+
+    async function getJson(url, options) {
+      const response = await fetch(url, options);
+      const data = await response.json();
+      if (!response.ok) {
+        const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+        throw new Error(detail || "Request failed");
+      }
+      return data;
+    }
+
+    // ---------- Main flow ----------
+    async function handleFile(file) {
+      if (!file) return;
+      showMessage("Uploading and processing...");
+      $("summary").innerHTML = "";
+      $("results").hidden = true;
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        const upload = await getJson("/api/files/", { method: "POST", body: form });
+        const [measurements, geojson] = await Promise.all([
+          getJson(`/api/files/${upload.id}/measurements/`),
+          getJson(`/api/files/${upload.id}/geojson/`),
+        ]);
+        render(upload, measurements, geojson);
+        showMessage("Done.");
+      } catch (err) {
+        showMessage(err.message, true);
+      }
+    }
+
+    function popupHtml(feature, m) {
+      const rows = [`<b>${esc(featureName(m.properties) || m.geometry_type)}</b> (${esc(m.geometry_type)}, feature ${m.index})`];
+      if (m.area_sq_m !== null) rows.push(`Area: ${fmt(m.area_sq_m)} m² (${fmt(m.area_sq_m / 10000)} ha)`);
+      if (m.length_m !== null) rows.push(`Length: ${fmt(m.length_m)} m`);
+      if (m.note) rows.push(esc(m.note));
+      for (const [key, value] of Object.entries(m.properties || {})) {
+        if (value !== null && value !== "") rows.push(`${esc(key)}: ${esc(value)}`);
+      }
+
+      rows.push('<button class="place-btn" type="button">Show place name</button><div class="place-out"></div>');
+      return rows.join("<br>");
+    }
+
+    function featureName(props) {
+    const key = Object.keys(props || {}).find((k) => k.toLowerCase() === "name");
+    return key && props[key] ? String(props[key]) : null;
+  }
+
+    function render(upload, data, geojson) {
+      const byIndex = Object.fromEntries(data.measurements.map((m) => [m.index, m]));
+
+      // Map layer
+      if (shapesLayer) map.removeLayer(shapesLayer);
+      Object.keys(layersByIndex).forEach((k) => delete layersByIndex[k]);
+
+      shapesLayer = L.geoJSON(geojson, {
+          style: (f) => {
+          const t = f.geometry.type;
+          if (t.includes("Point")) return { color: "#16a34a" };
+          return { color: t.includes("Polygon") ? "#2563eb" : "#ea580c", weight: 3 };
+        },
+        pointToLayer: (f, latlng) =>
+          L.circleMarker(latlng, { radius: 8, color: "#16a34a", fillOpacity: 0.7 }),
+        onEachFeature: (f, layer) => {
+          const m = byIndex[f.properties.feature_index];
+          layersByIndex[f.properties.feature_index] = layer;
+          if (m) {
+            layer.bindPopup(popupHtml(f, m));
+            layer.bindTooltip(esc(featureName(m.properties) || "Feature " + m.index), { sticky: true });
+          }
+        },
+      }).addTo(map);
+      if (shapesLayer.getLayers().length) {
+        map.fitBounds(shapesLayer.getBounds(), { padding: [30, 30] });
+      }
+
+      // Summary cards
+      const totalArea = data.measurements.reduce((s, m) => s + (m.area_sq_m || 0), 0);
+      const totalLength = data.measurements.reduce((s, m) => s + (m.length_m || 0), 0);
+      const cards = [
+        ["File", upload.filename],
+        ["CRS", data.crs],
+        ["Features", upload.feature_count],
+        ["Total area", `${fmt(totalArea)} m²`],
+        ["Total length", `${fmt(totalLength)} m`],
+      ];
+      $("summary").innerHTML = cards
+        .map(([label, value]) => `<div class="card"><b>${esc(value)}</b><span>${label}</span></div>`)
+        .join("");
+
+      // Table
+      const body = $("results").querySelector("tbody");
+      body.innerHTML = "";
+      data.measurements.forEach((m) => {
+        const row = document.createElement("tr");
+        row.innerHTML =
+        `<td>${m.index}</td><td>${esc(featureName(m.properties) || "Feature " + m.index)}</td>` +
+  `<td>${esc(m.geometry_type)}</td>` +
+  `<td>${m.area_sq_m !== null ? fmt(m.area_sq_m) + " m²" : "-"}</td>` +
+  `<td>${m.length_m !== null ? fmt(m.length_m) + " m" : "-"}</td>`;
+        row.addEventListener("click", () => focusFeature(m.index));
+        body.appendChild(row);
+      });
+      $("results").hidden = false;
+    }
+
+    function focusFeature(index) {
+      const layer = layersByIndex[index];
+      if (!layer) return;
+      if (layer.getBounds) map.fitBounds(layer.getBounds(), { maxZoom: 18 });
+      else map.setView(layer.getLatLng(), 18);
+      layer.openPopup();
+    }
+
+    // ---------- Upload controls ----------
+    $("fileInput").addEventListener("change", (e) => handleFile(e.target.files[0]));
+    const drop = $("drop");
+    drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+    drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+    drop.addEventListener("drop", (e) => {
+      e.preventDefault();
+      drop.classList.remove("over");
+      handleFile(e.dataTransfer.files[0]);
+    });
+
+    // Look up a place name only when the user asks for it
+map.on("popupopen", (e) => {
+  const el = e.popup.getElement();
+  const button = el.querySelector(".place-btn");
+  if (!button) return;
+  button.addEventListener("click", async () => {
+    const out = el.querySelector(".place-out");
+    out.textContent = "Looking up...";
+    try {
+      const { lat, lng } = e.popup.getLatLng();
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=16&lat=${lat}&lon=${lng}`
+      );
+      const data = await response.json();
+      out.textContent = data.display_name || "No place name found here.";
+    } catch (err) {
+      out.textContent = "Could not look up the place name.";
+    }
+  });
+});
+  </script>
+</body>
+</html>
