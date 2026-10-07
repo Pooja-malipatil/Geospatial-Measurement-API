@@ -27,7 +27,6 @@ A small **map viewer** is included as an extra: upload a file in the browser and
 
 ## Features
 
-**Required by the assignment**
 
 - `POST /api/files/` accepts a `.kml` or a `.zip` containing a Shapefile.
 - Every feature is extracted with its **index, geometry type, geometry, CRS and properties**.
@@ -36,7 +35,6 @@ A small **map viewer** is included as an extra: upload a file in the browser and
 - Unsupported geometries are handled gracefully with a note, never a crash.
 - `GET /api/files/{id}/` and `GET /api/files/{id}/measurements/`.
 
-**Extras added on top**
 
 - `GET /api/files/{id}/features/` returns the raw extracted features (all five required fields).
 - `GET /api/files/{id}/geojson/` returns the shapes as GeoJSON in EPSG:4326 for map display.
@@ -65,7 +63,7 @@ A small **map viewer** is included as an extra: upload a file in the browser and
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/geo-measurement-api.git
+git clone https://github.com/<Pooja-malipatil>/Geo-Measurement-API.git
 cd geo-measurement-api
 
 python -m venv venv
